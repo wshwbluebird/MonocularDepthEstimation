@@ -7,8 +7,14 @@ import numpy as np
     second tempt to change the interface matched with supplement material in the paper
 """
 
+# TODO 损失函数
+# TODO 输出函数
+# TODO 统计函数
+# TODO 模型函数
+
 class model():
-    def __init__(self,stride_way):
+    def __init__(self,use_deconv, stride_way):
+        self.use_deconv = use_deconv
         self.stride_Way = stride_way
 
 
@@ -97,23 +103,235 @@ class model():
         return self.encoder_conv_single(upsample, kernel_size, stride, channel_out)
 
     #TODO conv2d_transpose 源码
-    def decoder_deconv(self,input_layer, chanel_out,  kernel_size, scale):
+    def decoder_deconv(self,input_layer, channel_out,  kernel_size, scale):
         """
         反采样卷积层  采用反卷积的方式对图像进行扩大
         :param input_layer:  输入层
-        :param chanel_out:   输出通道的个数
+        :param channel_out:   输出通道的个数
         :param kernel_size:  每层卷积核的大小 {int}
         :param scale:        每层放缩的比例
         :return:    反卷积后的layer
         """
 
         p_x = tf.pad(input_layer, [[0, 0], [1, 1], [1, 1], [0, 0]])
-        conv = slim.conv2d_transpose(p_x, chanel_out, kernel_size, scale, 'SAME')
-        return conv[:, 3:-1, 3:-1, :]   #need to check after reading the source code of conv2d_transpose
+        conv = slim.conv2d_transpose(p_x, channel_out, kernel_size, scale, 'SAME')
+        return conv[:, 3:-1, 3:-1, :]   # need to check after reading the source code of conv2d_transpose
 
 
+    """
+        参考 https://arxiv.org/abs/1512.03385
+        原论文实现的ImageNet 和 shortcut    block的计算采用的是B
+        实现 参考的还是 UMDE 的source code
+    """
+    def encoder_res_conv(self, input_layer, channel_out, strides, active_fn_final=tf.nn.elu):
+        """
+        本质是 ImageNet 一个包含shortcut的block（Residual learning: a building block）
+        用于实现 1x1 3x3 1x1   + shortcut的模型
+        :param input_layer:   上一输入层
+        :param channel_out:   输出的参考的通道数(在这个函数中,输出的通道数是参考通道数的四倍)
+        :param strides:       步长  如果使用 identity shortcuts (Eqn.(1)）步长为1  需要扩大 则步长为2
+        :param active_fn_final  默认最后一步的激活函数
+        :return:  经过缩小后的4*channel_out的卷基层
+        """
+        # judge whether use projection
+        # TODO 原论文的实现是  tf.shape(input_layer)[3] !=  channel_out 但是个人认为应该*4  附原论文说明
+        """
+             The identity shortcuts (Eqn.(1)) can be directly used when the input and output are of the same dimensions
+              (solid line shortcuts in Fig. 3).
+        """
+        is_project = tf.shape(input_layer)[3] != 4 * channel_out or strides == 2
 
+        # 实现 1x1 3x3 1x1
+        shortcut = []
+        conv1 = self.encoder_conv_single(input_layer, channel_out, 1, 1)
+        conv2 = self.encoder_conv_single(conv1, channel_out, 3, strides)
+        conv3 = self.encoder_conv_single(conv2, 4 * channel_out, 1, 1, None)  # 最后一个none 制定不需要激活函数
 
+        if is_project:
+            # use projection
+            shortcut = self.encoder_conv_single(input_layer, 4 * channel_out, 1, strides, None)
+        else:
+            # use identity
+            shortcut = input_layer
 
+        return active_fn_final(conv3 + shortcut)
 
+    """
+       实现参考为 https://arxiv.org/abs/1512.03385 的Table1
+    """
+    def encoder_res_block(self,input_layer, channel_out, num_blocks):
+        """
+        resnet 的下采样卷积函数
+        :param input_layer: 上一输入层
+        :param channel_out: 参考输出通道数 （在这个函数中,输出的通道数是参考通道数的四倍)
+        :param num_blocks:  在这一个卷积中 有多少个block 数据来源为  https://arxiv.org/abs/1512.03385  Table1
+        :return:  conv下采样卷积结果
+        """
+        out = input_layer
+        for i in range(num_blocks - 1):
+            out = self.encoder_res_conv(out, channel_out, 1)
+        out = self.encoder_res_conv(out, channel_out, 2)
+        return out
 
+    def maxpool(self, input_layer, kernel_size):
+        """
+        最大池化层
+        :param input_layer:  上一层输入
+        :param kernel_size:   池化的核大小
+        :return:  池化后的结果
+        """
+        p = (kernel_size - 1) // 2
+        p_x = tf.pad(input_layer, [[0, 0], [p, p], [p, p], [0, 0]])
+        return slim.max_pool2d(p_x, kernel_size)
+
+    """
+        encoder 部分用VGG 网络建立
+    """
+    def build_vgg(self):
+        # set convenience functions
+        conv = self.encoder_conv_single
+        """
+           same with source code
+        """
+        if self.use_deconv:
+            upconv = self.decoder_deconv
+        else:
+            upconv = self.decoder_upconv
+
+        with tf.variable_scope('encoder'):
+            """
+             缩小层 特征提取
+             通道数逐渐增加,图片大小逐渐减少
+             最终返回的结果是 conv7b
+            """
+            conv1 = self.encoder_conv_twin(self.model_input, 32, 7)  # H/2
+            conv2 = self.encoder_conv_twin(conv1, 64, 5)  # H/4
+            conv3 = self.encoder_conv_twin(conv2, 128, 3)  # H/8
+            conv4 = self.encoder_conv_twin(conv3, 256, 3)  # H/16
+            conv5 = self.encoder_conv_twin(conv4, 512, 3)  # H/32
+            conv6 = self.encoder_conv_twin(conv5, 512, 3)  # H/64
+            conv7 = self.encoder_conv_twin(conv6, 512, 3)  # H/128
+
+        with tf.variable_scope('skips'):
+            """
+                copy the convx to skipx
+                why the scope'encoder' do not use stack
+            """
+            skip1 = conv1
+            skip2 = conv2
+            skip3 = conv3
+            skip4 = conv4
+            skip5 = conv5
+            skip6 = conv6
+
+        with tf.variable_scope('decoder'):
+            upconv7 = upconv(conv7, 512, 3, 2)  # H/64
+            concat7 = tf.concat([upconv7, skip6], 3)
+            iconv7 = conv(concat7, 512, 3, 1)
+
+            upconv6 = upconv(iconv7, 512, 3, 2)  # H/32
+            concat6 = tf.concat([upconv6, skip5], 3)
+            iconv6 = conv(concat6, 512, 3, 1)
+
+            upconv5 = upconv(iconv6, 256, 3, 2)  # H/16
+            concat5 = tf.concat([upconv5, skip4], 3)
+            iconv5 = conv(concat5, 256, 3, 1)
+
+            upconv4 = upconv(iconv5, 128, 3, 2)  # H/8
+            concat4 = tf.concat([upconv4, skip3], 3)
+            iconv4 = conv(concat4, 128, 3, 1)
+            self.disp4 = self.get_disp(iconv4)
+            udisp4 = self.upsample(self.disp4, 2)
+
+            upconv3 = upconv(iconv4, 64, 3, 2)  # H/4
+            concat3 = tf.concat([upconv3, skip2, udisp4], 3)
+            iconv3 = conv(concat3, 64, 3, 1)
+            self.disp3 = self.get_disp(iconv3)
+            udisp3 = self.upsample(self.disp3, 2)
+
+            upconv2 = upconv(iconv3, 32, 3, 2)  # H/2
+            concat2 = tf.concat([upconv2, skip1, udisp3], 3)
+            iconv2 = conv(concat2, 32, 3, 1)
+            self.disp2 = self.get_disp(iconv2)
+            udisp2 = self.upsample(self.disp2, 2)
+
+            upconv1 = upconv(iconv2, 16, 3, 2)  # H
+            concat1 = tf.concat([upconv1, udisp2], 3)
+            iconv1 = conv(concat1, 16, 3, 1)
+            self.disp1 = self.get_disp(iconv1)
+
+    """
+         encoder 部分用ImageNet 网络建立
+    """
+    def build_resnet50(self):
+        # set convenience functions
+        conv = self.encoder_conv_single
+
+        if self.use_deconv:
+            upconv = self.decoder_deconv
+        else:
+            upconv = self.decoder_upconv
+
+        with tf.variable_scope('encoder'):
+
+            """
+             缩小层 特征提取
+             通道数逐渐增加,图片大小逐渐减少
+             最终返回的结果是 conv5
+             实现模型  https://arxiv.org/abs/1512.03385 table3  第三列
+
+            """
+
+            conv1 = conv(self.model_input, 64, 7, 2)  # H/2  -   64D
+            pool1 = self.maxpool(conv1, 3)  # H/4  -   64D
+            conv2 = self.encoder_res_block(pool1, 64, 3)  # H/8  -  256D
+            conv3 = self.encoder_res_block(conv2, 128, 4)  # H/16 -  512D
+            conv4 = self.encoder_res_block(conv3, 256, 6)  # H/32 - 1024D
+            conv5 = self.encoder_res_block(conv4, 512, 3)  # H/64 - 2048D
+
+        """
+            copy the convx to skipx
+        """
+        with tf.variable_scope('skips'):
+            skip1 = conv1
+            skip2 = pool1
+            skip3 = conv2
+            skip4 = conv3
+            skip5 = conv4
+
+        # DECODING
+        with tf.variable_scope('decoder'):
+            """
+                just copy from the source code
+            """
+
+            upconv6 = upconv(conv5, 512, 3, 2)  # H/32
+            concat6 = tf.concat([upconv6, skip5], 3)
+            iconv6 = conv(concat6, 512, 3, 1)
+
+            upconv5 = upconv(iconv6, 256, 3, 2)  # H/16
+            concat5 = tf.concat([upconv5, skip4], 3)
+            iconv5 = conv(concat5, 256, 3, 1)
+
+            upconv4 = upconv(iconv5, 128, 3, 2)  # H/8
+            concat4 = tf.concat([upconv4, skip3], 3)
+            iconv4 = conv(concat4, 128, 3, 1)
+            self.disp4 = self.get_disp(iconv4)
+            udisp4 = self.upsample(self.disp4, 2)
+
+            upconv3 = upconv(iconv4, 64, 3, 2)  # H/4
+            concat3 = tf.concat([upconv3, skip2, udisp4], 3)
+            iconv3 = conv(concat3, 64, 3, 1)
+            self.disp3 = self.get_disp(iconv3)
+            udisp3 = self.upsample(self.disp3, 2)
+
+            upconv2 = upconv(iconv3, 32, 3, 2)  # H/2
+            concat2 = tf.concat([upconv2, skip1, udisp3], 3)
+            iconv2 = conv(concat2, 32, 3, 1)
+            self.disp2 = self.get_disp(iconv2)
+            udisp2 = self.upsample(self.disp2, 2)
+
+            upconv1 = upconv(iconv2, 16, 3, 2)  # H
+            concat1 = tf.concat([upconv1, udisp2], 3)
+            iconv1 = conv(concat1, 16, 3, 1)
+            self.disp1 = self.get_disp(iconv1)
